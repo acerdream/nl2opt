@@ -5,10 +5,11 @@
 - **关键历史回归**：与具体 P0/P1/P2 缺陷或协议约定绑定的**工具/脚本级**断言
   （config / pricing / 协议版本 / 状态映射 / 差异分类 / 提示词分层 / 语义不变 / 沙箱信封 /
   消融口径 / 分阶段记账）。
-- **pytest 派发**：核心单元/集成断言已迁移到 `tests/`（test_ir_validation /
-  test_solver_backend_parity / test_verifier_solution_integrity / test_llm_response_handling /
-  test_orchestrator_routing / test_cache_context）。若环境中安装了 pytest，则本入口
-  一并运行 `pytest tests/` 并聚合结果；否则打印清晰提示（`pip install -e .[dev]`）。
+- **pytest 派发**：核心单元/集成断言已迁移到 `tests/`（test_expand / test_foreach_rows /
+  test_bind_value / test_index_arithmetic / test_symbolic_rewrite / test_precheck_files /
+  test_auto_add_instances / test_expand_dedup / test_ir_validation / test_llm_response_handling）。
+  若环境中安装了 pytest，则本入口一并运行 `pytest tests/` 并聚合结果；
+  否则打印清晰提示（`pip install -e .[dev]`）。
 
 这样：无 pytest 环境仍能跑完 smoke + 关键回归；有 pytest 环境则得到完整分层覆盖。
 """
@@ -24,12 +25,121 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from nl2opt.gold_ir import get_gold_ir  # noqa: E402
 from nl2opt.solver import solve  # noqa: E402
 from nl2opt import verifier  # noqa: E402
 from nl2opt.config import load_config  # noqa: E402
-from nl2opt.dataset import load_builtin  # noqa: E402
-from nl2opt.pipeline import run_dataset, run_sample  # noqa: E402
+from nl2opt.pipeline import run_sample  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 手写的极小 IR 夹具
+#
+# 用手写 IR 作夹具，只验证**机制**（求解器接线、状态映射、重写闭环、
+# 阶段记账），不依赖任何数据集。
+# ---------------------------------------------------------------------------
+
+def _make_ir(variables, objective, constraints):
+    from nl2opt.ir import IR
+
+    return IR(variables=variables, objective=objective, constraints=constraints)
+
+
+def _knapsack_ir():
+    """max 60x1+100x2+120x3, s.t. 10x1+20x2+30x3<=50 → 最优 220（选 x2,x3）。"""
+    from nl2opt.ir import Constraint, LinearExpr, Objective, Sense, Term, Variable, VarType
+
+    return _make_ir(
+        variables=[Variable(name=f"x{i}", var_type=VarType.binary) for i in (1, 2, 3)],
+        objective=Objective(sense=Sense.maximize, expr=LinearExpr(terms=[
+            Term(var="x1", coef=60.0),
+            Term(var="x2", coef=100.0),
+            Term(var="x3", coef=120.0),
+        ])),
+        constraints=[Constraint(
+            name="capacity", sense=Sense.le,
+            lhs=LinearExpr(terms=[
+                Term(var="x1", coef=10.0),
+                Term(var="x2", coef=20.0),
+                Term(var="x3", coef=30.0),
+            ]),
+            rhs=50.0,
+        )],
+    )
+
+
+def _symbolic_knapsack(capacity: float, data_dir: Path) -> dict:
+    """**符号版**背包（数值写在 `data_dir/items.csv`）：max Σ value_i x_i, s.t. Σ weight_i x_i ≤ capacity。
+
+    返回符号模型 dict。用真实数据文件是刻意的 —— 它同时覆盖「csv 列做 dims」
+    「DataRef 按 key 取值」「expand 展开」三件事，也就是 pipeline 现在**唯一**的建模链路。
+
+    `data_dir` 由调用方给：**必须落在工作区内**（文件沙箱只允许写工作区，
+    系统临时目录会被拒绝）。
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "items.csv").write_text(
+        "item,value,weight\n1,60,10\n2,100,20\n3,120,30\n", encoding="utf-8")
+    return {
+        "variables": [
+            {"name": "x",
+             "dims": [{"kind": "csv", "file": "items.csv", "column": "item"}],
+             "var_type": "binary"}
+        ],
+        "objective": {"sense": "maximize", "expr": {"terms": [
+            {"var": "x_{i}", "ref": {"file": "items.csv", "column": "value",
+                                     "key_column": "item", "key_value": "{i}"}}]}},
+        "constraints": [{
+            "name": "capacity", "sense": "<=", "rhs": capacity,
+            "lhs": {"terms": [
+                {"var": "x_{i}", "ref": {"file": "items.csv", "column": "weight",
+                                         "key_column": "item", "key_value": "{i}"}}]},
+        }],
+    }
+
+
+def _scratch_dir(name: str) -> Path:
+    """在工作区 `artifacts/` 下造一个一次性数据目录。
+
+    为什么不用 `tempfile.TemporaryDirectory`：文件沙箱不允许写系统临时目录，
+    且 TemporaryDirectory 会 `chmod 0o700`（同样被拒）。调用方负责清理。
+    """
+    import shutil
+
+    d = Path(__file__).resolve().parents[1] / "artifacts" / name
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _infeasible_ir():
+    """x >= 5 且 x <= 3 → 不可行。"""
+    from nl2opt.ir import Constraint, LinearExpr, Objective, Sense, Term, Variable
+
+    return _make_ir(
+        variables=[Variable(name="x", lower=0.0)],
+        objective=Objective(sense=Sense.minimize,
+                            expr=LinearExpr(terms=[Term(var="x", coef=1.0)])),
+        constraints=[
+            Constraint(name="lo", sense=Sense.ge,
+                       lhs=LinearExpr(terms=[Term(var="x", coef=1.0)]), rhs=5.0),
+            Constraint(name="hi", sense=Sense.le,
+                       lhs=LinearExpr(terms=[Term(var="x", coef=1.0)]), rhs=3.0),
+        ],
+    )
+
+
+def _unbounded_ir():
+    """max x, x >= 0，无上界 → 无界。"""
+    from nl2opt.ir import Constraint, LinearExpr, Objective, Sense, Term, Variable
+
+    return _make_ir(
+        variables=[Variable(name="x", lower=0.0)],
+        objective=Objective(sense=Sense.maximize,
+                            expr=LinearExpr(terms=[Term(var="x", coef=1.0)])),
+        constraints=[Constraint(name="lo", sense=Sense.ge,
+                                lhs=LinearExpr(terms=[Term(var="x", coef=1.0)]), rhs=0.0)],
+    )
 
 
 def approx(a, b, tol=1e-4):
@@ -85,61 +195,168 @@ def main() -> int:
 
     # ===================== Smoke：确定性链路能跑通 =====================
 
-    # 1) 黄金 IR 求解值
-    for sid, exp in [
-        ("lp-01", 158.0), ("knapsack-01", 220.0), ("knapsack-02", 90.0),
-        ("transport-01", 420.0), ("assignment-01", 5.0), ("integer-01", 40.0),
-        ("diet-01", 15.6),
-    ]:
-        def _t(sid=sid, exp=exp):
-            ir = get_gold_ir(sid)
-            sol = solve(ir)
-            assert sol.success, sol.message
-            assert approx(sol.objective_value, exp), (sid, sol.objective_value, exp)
-        check(f"gold_ir[{sid}] -> {exp}", _t)
+    # 1) 求解器接线（手写 IR，不依赖任何数据集）
+    def _solve_knapsack():
+        sol = solve(_knapsack_ir())
+        assert sol.success, sol.message
+        assert approx(sol.objective_value, 220.0), sol.objective_value
+        assert sol.variables["x2"] == 1.0 and sol.variables["x3"] == 1.0
+    check("solver: hand-written knapsack -> 220", _solve_knapsack)
 
-    # 2) 特殊状态
+    # 2) 特殊状态映射
     def _infeasible():
-        assert solve(get_gold_ir("infeasible-01")).status == "infeasible"
-    check("infeasible-01 status", _infeasible)
+        assert solve(_infeasible_ir()).status == "infeasible"
+    check("infeasible status", _infeasible)
 
     def _unbounded():
-        assert solve(get_gold_ir("unbounded-01")).status == "unbounded"
-    check("unbounded-01 status", _unbounded)
+        assert solve(_unbounded_ir()).status == "unbounded"
+    check("unbounded status", _unbounded)
 
-    # 3) 端到端内置样例全部通过（无 LLM，确定性链路）
-    def _e2e():
-        cfg = load_config()
-        ds = load_builtin()
-        results = run_dataset(ds, llm=None, cfg=cfg)
-        bad = [(r.sample_id, r.errors) for r in results if not r.success]
-        assert not bad, bad
-    check("e2e builtin all pass", _e2e)
+    # 3) 端到端 —— 用真实数据集跑：
+    #    python -m nl2opt eval --data data/MIPLIB-NL/dataset/<id>
 
-    # 4) 重写闭环 smoke：首轮错 → 反思 → 重写修复
+    # 4) 重写闭环 smoke：首轮错（容量写大）→ 失败 → 符号层重写 → 修复
     def _rewrite_loop():
+        import shutil
+
         from nl2opt.dataset import Sample
         from nl2opt.llm.fake import ScriptedProvider
 
-        correct = get_gold_ir("knapsack-01").model_dump()
-        wrong = json.loads(json.dumps(correct))
-        for t in wrong["objective"]["expr"]["terms"]:
-            if t["var"] == "x2":
-                t["coef"] = 1000.0
-        llm = ScriptedProvider([
-            json.dumps(wrong, ensure_ascii=False),
-            "建模错误：系数错误",
-            json.dumps(correct, ensure_ascii=False),
-        ])
-        result = run_sample(Sample(id="test-rewrite", nl_text="测试重写闭环",
-                                   problem_type="milp", expected={"objective_value": 220.0}),
-                            llm=llm, cfg=load_config())
+        data_dir = _scratch_dir("_smoke_knap")
+        try:
+            # 容量写在符号模型的 rhs 里（不在 CSV），所以两轮共用同一份数据目录
+            wrong = _symbolic_knapsack(60.0, data_dir)   # 容量 60 → 280 ≠ 220
+            right = _symbolic_knapsack(50.0, data_dir)   # 容量 50 → 220
+            llm = ScriptedProvider([
+                json.dumps(wrong, ensure_ascii=False),
+                json.dumps(right, ensure_ascii=False),
+            ])
+            result = run_sample(
+                Sample(id="test-rewrite", nl_text="测试重写闭环", problem_type="milp",
+                       expected={"objective_value": 220.0},
+                       extra={"data_dir": str(data_dir)}),
+                llm=llm, cfg=load_config())
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
         assert result.success is True, result.errors
-        assert result.rounds == 2
-        assert result.objective_value == 220.0
-    check("rewrite loop repairs IR (smoke)", _rewrite_loop)
+        assert result.rounds == 2, result.rounds
+        assert result.objective_value == 220.0, result.objective_value
+        # 重写发生在符号层（不是展平层）；标记挂在**被重写的那一轮**上
+        layers = [s.get("rewrite_layer") for s in result.trajectory if isinstance(s, dict)]
+        assert "symbolic" in layers, layers
+    check("rewrite loop repairs symbolic IR (smoke)", _rewrite_loop)
 
     # ===================== 关键历史回归（工具/脚本/协议级） =====================
+
+    # 4b) 无数据文件的自由题面：走**同一条**符号链路（空 DataStore），不需要 CSV
+    def _no_data_symbolic():
+        from nl2opt.dataset import Sample
+        from nl2opt.llm.fake import ScriptedProvider
+
+        sym = {
+            "variables": [{"name": "x",
+                           "dims": [{"kind": "list", "values": ["1", "2", "3"]}],
+                           "var_type": "binary"}],
+            "objective": {"sense": "maximize",
+                          "expr": {"terms": [{"var": "x_{i}", "coef": 50.0}]}},
+            "constraints": [{"name": "capacity_{i}", "for_each": "i", "sense": "<=",
+                             "rhs": 100.0,
+                             "lhs": {"terms": [{"var": "x_{i}", "coef": 10.0}]}}],
+        }
+        llm = ScriptedProvider([json.dumps(sym, ensure_ascii=False)])
+        # 注意：没有 extra["data_dir"] —— 关键就是这条分支也要能展开
+        result = run_sample(
+            Sample(id="test-nodata", nl_text="自由题面：三个物品，每个最多拿一个",
+                   problem_type="milp", expected={"objective_value": 150.0}),
+            llm=llm, cfg=load_config())
+        assert result.success is True, result.errors
+        assert result.objective_value == 150.0, result.objective_value
+    check("free-form text goes through expand (no data files)", _no_data_symbolic)
+
+    # 4c) 无 LLM 且无内嵌 IR → 明确报错，不静默产出空模型
+    def _no_model_source():
+        from nl2opt.dataset import Sample
+        result = run_sample(Sample(id="test-nomodel", nl_text="x"), llm=None,
+                            cfg=load_config())
+        assert result.success is False
+        assert any("无法理解" in e for e in result.errors), result.errors
+    check("no LLM and no embedded IR fails loudly", _no_model_source)
+
+    # 4d) 展开失败**可被重写修复**（旧实现直接终止，rounds=0）
+    def _expand_failure_is_repairable():
+        from nl2opt.dataset import Sample
+        from nl2opt.llm.fake import ScriptedProvider
+
+        ghost = {   # LLM 编了一个不存在的数据文件（sorrell3 实测就是这样）
+            "variables": [{"name": "x",
+                           "dims": [{"kind": "csv", "file": "ghost.csv", "column": "id"}],
+                           "var_type": "binary"}],
+            "objective": {"sense": "minimize",
+                          "expr": {"terms": [{"var": "x_{i}", "coef": 1.0}]}},
+            "constraints": [{"name": "c", "sense": ">=", "rhs": 1.0,
+                             "lhs": {"terms": [{"var": "x_{i}", "coef": 1.0}]}}],
+        }
+        fixed = json.loads(json.dumps(ghost))
+        fixed["variables"] = [{"name": "x", "dims": [{"kind": "list", "values": ["1", "2"]}],
+                               "var_type": "binary"}]
+
+        llm = ScriptedProvider([json.dumps(ghost, ensure_ascii=False),
+                                json.dumps(fixed, ensure_ascii=False)])
+        result = run_sample(
+            Sample(id="test-expand-fix", nl_text="测试展开失败修复", problem_type="milp",
+                   expected={"objective_value": 1.0},
+                   extra={"data_dir": "data/MIPLIB-NL/dataset/b-ball"}),
+            llm=llm, cfg=load_config())
+        assert result.success is True, result.errors
+        assert result.rounds == 2, result.rounds
+        assert not llm.responses, "第二次 LLM 调用没被用上（展开失败仍然终止了）"
+
+        # 重写也救不回来时：不崩溃，按轮数/重复错误收尾
+        llm2 = ScriptedProvider([json.dumps(ghost, ensure_ascii=False)] * 3)
+        result2 = run_sample(
+            Sample(id="test-expand-stuck", nl_text="测试展开一直失败", problem_type="milp",
+                   expected={"objective_value": 1.0},
+                   extra={"data_dir": "data/MIPLIB-NL/dataset/b-ball"}),
+            llm=llm2, cfg=load_config())
+        assert result2.success is False
+        assert result2.status in ("repeated_error", "max_rounds_exceeded"), result2.status
+        assert any("展开" in e for e in result2.errors), result2.errors
+    check("expand failure is repairable by rewrite", _expand_failure_is_repairable)
+
+    # 4e) 重写把模型改缩水 → 拒绝采用，保留本轮结果（展开后退化守卫）
+    def _degenerate_rewrite_rejected():
+        from nl2opt.dataset import Sample
+        from nl2opt.llm.fake import ScriptedProvider
+
+        def model(values):
+            return {
+                "variables": [{"name": "x", "dims": [{"kind": "list", "values": values}],
+                               "var_type": "binary"}],
+                "objective": {"sense": "minimize",
+                              "expr": {"terms": [{"var": "x_{i}", "coef": 1.0}]}},
+                "constraints": [
+                    {"name": "c1_{i}", "for_each": "i", "sense": "<=", "rhs": 1.0,
+                     "lhs": {"terms": [{"var": "x_{i}", "coef": 1.0}]}},
+                    {"name": "c2_{i}", "for_each": "i", "sense": ">=", "rhs": 0.0,
+                     "lhs": {"terms": [{"var": "x_{i}", "coef": 1.0}]}},
+                ],
+            }
+
+        full = model(["1", "2", "3", "4", "5"])   # 5 变量 / 10 约束
+        shrunk = model(["1"])                     # 1 变量 / 2 约束 ← 缩水 80%
+        llm = ScriptedProvider([json.dumps(full, ensure_ascii=False),
+                                json.dumps(shrunk, ensure_ascii=False)])
+        result = run_sample(
+            Sample(id="test-degenerate", nl_text="测试退化重写", problem_type="milp",
+                   expected={"objective_value": 5.0}),
+            llm=llm, cfg=load_config())
+        assert result.success is False
+        assert result.rounds == 1, result.rounds
+        assert any("退化" in e for e in result.errors), result.errors
+        # 必须保留**未缩水**的那一版模型
+        n_inst = sum(len(v.get("index_set") or []) for v in result.final_ir["variables"])
+        assert n_inst == 5, f"采用了缩水模型（{n_inst} 个变量实例）"
+    check("degenerate rewrite rejected (keeps bigger model)", _degenerate_rewrite_rejected)
 
     # 5) 配置包装器：`in` / 遍历（否则会 KeyError: 0 崩溃）
     def _config_contains():
@@ -171,25 +388,9 @@ def main() -> int:
         assert rc._price(blk, "idle", "output", 99.0) == 99.0
     check("cost report picks price by model", _pricing_by_model)
 
-    # 7) 协议版本校验：跨批次对比须版本一致，未知版本默认拒绝
-    def _protocol_version():
-        import ablation
-        from nl2opt import PROTOCOL_VERSION
-        assert isinstance(PROTOCOL_VERSION, int) and PROTOCOL_VERSION >= 1
-        a = {"name": "a", "protocol_version": 3}
-        b = {"name": "b", "protocol_version": 3}
-        legacy = {"name": "legacy", "protocol_version": None}
-        older = {"name": "older", "protocol_version": 2}
-        assert ablation._pair_comparable(a, b, None)[0] is True
-        ok, why = ablation._pair_comparable(a, older, None)
-        assert ok is False and "v3" in why and "v2" in why, why
-        ok, why = ablation._pair_comparable(a, legacy, None)
-        assert ok is False and "未知" in why, why
-        assert ablation._pair_comparable(a, legacy, 3)[0] is True
-        assert ablation._pair_comparable(legacy, legacy, 3)[0] is True
-        assert ablation._pair_comparable(legacy, legacy, None)[0] is False
-        assert ablation._pair_comparable(a, legacy, 2)[0] is False
-    check("protocol version gates cross-batch compare", _protocol_version)
+    # 7) 协议版本校验（跨批次对比）—— **已移除**
+    # 原检查依赖 `ablation._pair_comparable`；该脚本用于旧数据集的多批次 A/B 对比，
+    # 已随数据集更换删除。`PROTOCOL_VERSION` 常量本身仍在 `nl2opt/__init__.py`。
 
     # 8) _map_status：status=1 一律 timeout（不变量：只设 time_limit）
     def _map_status_mapping():
@@ -215,52 +416,35 @@ def main() -> int:
             assert forbidden not in src, f"新增 {forbidden} 后须重新区分 status=1"
     check("_map_status mapping + timeout invariant", _map_status_mapping)
 
-    # 9) 目标差异细分：忽略权重 / 纯省略 / 同倍数 / 系数错配
-    def _divergence_classify():
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "report_orbench_nl", Path(__file__).resolve().parents[1] / "scripts" / "report_orbench_nl.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        c = mod._classify_divergence
-        with_w = '{"jobs": [{"weight": 4}, {"weight": 3}, {"weight": 1}]}'
-        assert c([1, 2, 2, 3, 3, 3, 4, 4], [1] * 8, with_w) == "unit_weights"
-        assert c([1, 2, 4, 4], [1, 1, 1, 1], with_w) == "unit_weights"
-        assert c([1, 2, 4, 4], [1, 1, 1, 1], "no weights stated here") == "under_specified"
-        assert c([1, 2, 4, 4], [1, 1, 1, 1]) == "under_specified"
-        assert c([4, 5, 7, 11, 12, 12, 22, 38, 40], [4, 5, 7, 11, 12, 12, 38]) == "subset"
-        assert c([1, 2, 3], [2, 4, 6]) == "scaled"
-        assert c([3, 3, 8, 8], [5, 5, 6, 6]) == "other"
-        assert c([2, 2, 2], [3, 3, 3], with_w) != "unit_weights"
-    check("objective divergence classification", _divergence_classify)
+    # 9) 目标差异细分 —— **已移除**（原依赖的归因脚本已删除）。
 
-    # 10) 提示词分层：卡片按题面触发，核心不含数据集专属词汇
-    def _prompt_layering():
-        from nl2opt.pipeline.prompts import CARDS, CORE_PROMPT, build_system_prompt, select_cards
-        assert select_cards("at most 40% of shifts can be vans") == ["ratio"]
-        assert select_cards("there must be at least 3 times as many X as Y") == ["multiple"]
-        assert select_cards("Schedule jobs on machines M1 without overlap") == ["scheduling"]
-        assert select_cards("plan 3 weeks of inventory for 2 SKUs") == ["inventory"]
-        assert select_cards("Assign each task to at most one eligible technician") == ["assignment"]
-        assert select_cards("Assign tasks to machines on a schedule") == ["scheduling", "assignment"]
-        for phrase, want in [
-            ("Invest at least three times as much as in healthcare", "multiple"),
-            ("there must be three times more escalators than elevators", "multiple"),
-            ("at most half as much chlorine as water softener", "multiple"),
-            ("Limit the number of low-powered models to only 30%", "ratio"),
-            ("a minimum of 20% should occur on Pi TV", "ratio"),
-            ("the first mix contains 20% cat paw snacks", "ratio"),
-        ]:
-            got = select_cards(phrase)
-            assert want in got, f"{phrase!r} 应触发 {want}，实得 {got}"
+    # 10) 提示词：符号核心是唯一在用的提示词；领域卡片**未接入**（接线状态断言）
+    def _prompt_wiring():
+        from nl2opt.pipeline.prompts import (
+            CARDS, CORE_PROMPT, SYMBOLIC_CORE_PROMPT, build_system_prompt, prompt_stats,
+            select_cards,
+        )
+        # 不管题面命中了哪些卡片，system prompt 都**等于**符号核心本身
+        for text in ("at most 40% of shifts can be vans",
+                     "Assign tasks to machines on a schedule",
+                     "plan 3 weeks of inventory for 2 SKUs",
+                     ""):
+            assert build_system_prompt(text) == SYMBOLIC_CORE_PROMPT, \
+                f"卡片被意外注入符号提示词（题面 {text!r}）"
+        # 卡片表仍完好（将来接回时不用重新校对），但 select_cards 的结果不再影响 prompt
         assert "ratio" in select_cards("investments earn 3% and healthcare earn 1%")
         assert "收益率" in CARDS["ratio"]["body"]
         assert "fixed_cost" in CARDS and "piecewise" in CARDS
-        # 核心不含数据集专属词（防过拟合：核心是跨族通用，专属词须进卡片）
+        # prompt_stats 必须如实反映「没有卡片」
+        stats = prompt_stats("at most 40% of shifts can be vans")
+        assert stats["cards"] == [] and stats["symbolic"] is True, stats
+        assert stats["prompt_chars"] == len(SYMBOLIC_CORE_PROMPT)
+        # 防过拟合：核心是跨族通用，数据集专属词不得出现在**实际使用的**核心里
         for token in ("pill", "dose", "van", "trip", "bowl", "meal", "serving", "diet"):
-            assert token not in CORE_PROMPT, f"数据集专属词 {token} 泄漏进核心提示词"
-        _ = build_system_prompt("test")
-    check("prompt layering (core + cards)", _prompt_layering)
+            assert token not in SYMBOLIC_CORE_PROMPT, f"数据集专属词 {token} 泄漏进符号核心"
+        # 展平核心仍在（未接入），但不得与之混淆
+        assert CORE_PROMPT != SYMBOLIC_CORE_PROMPT
+    check("prompt wiring (symbolic core only, cards unwired)", _prompt_wiring)
 
     # 11) 消融口径：prompt_mode 记录用于 A/B 配对
     def _prompt_mode_recorded():
@@ -283,134 +467,53 @@ def main() -> int:
         assert d["protocol_version"] == importlib.import_module("nl2opt").PROTOCOL_VERSION
     check("prompt_mode recorded for ablation pairing", _prompt_mode_recorded)
 
-    # 12) 语义不变性：约束顺序/变量重命名无关，能检出漏约束与定义域变化
-    def _semantic_invariance():
-        from nl2opt.ir import Constraint, IR, LinearExpr, Objective, Sense, Term, VarType, Variable
-        from nl2opt.semantic import has_semantic_gap, semantic_diff
+    # 12) 语义不变性检查 —— **已移除**
+    # `semantic.py` 只服务「与参考 IR 对比覆盖率」，而验证器已精简为
+    # 「最优性比对 + 可行性断言」两项，该模块一并删除。
 
-        def mk(cons_order=(0, 1, 2), names=("x", "y"),
-               y_type=VarType.continuous, y_upper=None, drop_con=False, obj_y=2):
-            nx, ny = names
-            cons = [
-                Constraint(name="c1", sense=Sense.le,
-                           lhs=LinearExpr(terms=[Term(var=nx, coef=2), Term(var=ny, coef=1)]), rhs=10),
-                Constraint(name="c2", sense=Sense.ge,
-                           lhs=LinearExpr(terms=[Term(var=nx, coef=1), Term(var=ny, coef=3)]), rhs=8),
-                Constraint(name="c3", sense=Sense.eq,
-                           lhs=LinearExpr(terms=[Term(var=ny, coef=1)]), rhs=2),
-            ]
-            if drop_con:
-                cons = cons[:2]
-            return IR(
-                variables=[Variable(name=nx, var_type=VarType.continuous, lower=0),
-                           Variable(name=ny, var_type=y_type, lower=0, upper=y_upper)],
-                objective=Objective(sense=Sense.maximize, expr=LinearExpr(
-                    terms=[Term(var=nx, coef=3), Term(var=ny, coef=obj_y)])),
-                constraints=[cons[i] for i in cons_order],
-            )
 
-        base = mk()
-        assert not has_semantic_gap(semantic_diff(base, mk(cons_order=(2, 0, 1))))
-        assert not has_semantic_gap(semantic_diff(base, mk(names=("u", "v"))))
-        assert not has_semantic_gap(semantic_diff(mk(y_type=VarType.binary, y_upper=1),
-                                                  mk(y_type=VarType.integer, y_upper=1)))
-        assert has_semantic_gap(semantic_diff(base, mk(drop_con=True, cons_order=(0, 1))))
-        assert semantic_diff(base, mk(y_type=VarType.integer))["domain_mismatch"] is True
-        assert semantic_diff(base, mk(obj_y=5))["objective_mismatch"] is True
-    check("semantic: order/rename invariant + detects gaps", _semantic_invariance)
+    # 14) 消融判定语义 —— **已移除**
+    # 原检查依赖 `ablation._degenerate_objective`，同上（ablation 已删）。
+    # 「目标退化」的等价判定现在由 `nl2opt.pipeline.expand` / `ir.objective_is_degenerate` 承担。
 
-    # 13) 沙箱信封解析（纯函数，不需要 Docker）
-    def _sandbox_envelope():
-        from nl2opt import sandbox as sb_mod
-        raw = ("noise line from docker\n"
-               '{"exec_status": "ok", "solver": {"status": "optimal", '
-               '"objective_value": 5.0, "variables": {"x": 1.0}}}\n')
-        env = sb_mod._parse_envelope(raw)
-        assert env is not None and env["exec_status"] == "ok"
-        res = sb_mod._to_sandbox_result(env)
-        assert res.ok and res.solver_status == "optimal"
-        assert res.objective_value == 5.0 and res.variables == {"x": 1.0}
-    check("sandbox parses envelope", _sandbox_envelope)
-
-    # 14) 消融判定语义：首轮通过 / 无验证接受条件 / 黄金值比对 / 目标退化
-    def _ablation_logic():
-        import ablation
-        from nl2opt.ir import Constraint, IR, LinearExpr, Objective, Sense, Term, VarType, Variable
-
-        ok_res = {"success": False, "rounds": 2, "trajectory": [
-            {"understand_meta": {"source": "llm"}},
-            {"round": 1, "checks": [{"ok": True}, {"ok": True}], "route": None},
-        ]}
-        assert ablation._first_round_ok(ok_res) is True
-        bad_res = {"success": True, "rounds": 2, "trajectory": [
-            {"understand_meta": {}},
-            {"round": 1, "checks": [{"ok": False}, {"ok": True}], "route": "L2(重写IR)"},
-            {"round": 2, "checks": [{"ok": True}]},
-        ]}
-        assert ablation._first_round_ok(bad_res) is False
-        assert ablation._first_round_ok({"trajectory": [{"understand_meta": {}}]}) is False
-
-        opt = {"trajectory": [{"round": 1, "status": "optimal", "objective_value": 2.0}]}
-        assert ablation._definite_answer(opt) is True
-        assert ablation._definite_answer({"trajectory": [{"round": 1, "status": "error"}]}) is False
-        assert ablation._definite_answer({"status": "optimal"}) is False
-        stuck = {"status": "repeated_error",
-                 "trajectory": [{"round": 1, "status": "optimal", "objective_value": 2.0},
-                                {"round": 2, "status": "optimal", "objective_value": 2.0}]}
-        assert ablation._definite_answer(stuck) is True
-        assert ablation._matches_gold(opt, {"objective_value": 2.0}) is True
-        assert ablation._matches_gold(opt, {"objective_value": 63.0}) is False
-        inf = {"trajectory": [{"round": 1, "status": "infeasible"}]}
-        assert ablation._matches_gold(inf, {"status": "infeasible"}) is True
-        assert ablation._matches_gold(stuck, {"status": "infeasible"}) is False
-
-        def _ir_with(terms):
-            return IR(
-                variables=[Variable(name="t", var_type=VarType.continuous, lower=0)],
-                objective=Objective(sense=Sense.minimize, expr=LinearExpr(terms=terms)),
-                constraints=[Constraint(name="c1", sense=Sense.ge,
-                                        lhs=LinearExpr(terms=[Term(var="t", coef=1)]), rhs=1)],
-            ).model_dump()
-        assert ablation._degenerate_objective({"final_ir": _ir_with([])}) is True
-        assert ablation._degenerate_objective({"final_ir": _ir_with([Term(var="t", coef=0.0)])}) is True
-        assert ablation._degenerate_objective({"final_ir": _ir_with([Term(var="t", coef=3.0)])}) is False
-        assert ablation._degenerate_objective({}) is False
-    check("ablation variant semantics", _ablation_logic)
-
-    # 15) 分阶段 token 记账
+    # 15) 分阶段 token 记账（符号链路：understand + rewrite 各一次）
     def _stage_usage():
+        import shutil
+
         from nl2opt.dataset import Sample
         from nl2opt.llm.fake import ScriptedProvider
-        correct = get_gold_ir("knapsack-01").model_dump()
-        wrong = json.loads(json.dumps(correct))
-        for t in wrong["objective"]["expr"]["terms"]:
-            if t["var"] == "x2":
-                t["coef"] = 1000.0
-        llm = ScriptedProvider([
-            json.dumps(wrong, ensure_ascii=False),
-            "建模错误：系数错误",
-            json.dumps(correct, ensure_ascii=False),
-        ])
-        result = run_sample(Sample(id="test-stage-usage", nl_text="测试分阶段记账",
-                                   problem_type="milp", expected={"objective_value": 220.0}),
-                            llm=llm, cfg=load_config())
+        data_dir = _scratch_dir("_smoke_usage")
+        try:
+            wrong = _symbolic_knapsack(60.0, data_dir)
+            right = _symbolic_knapsack(50.0, data_dir)
+            llm = ScriptedProvider([
+                json.dumps(wrong, ensure_ascii=False),
+                json.dumps(right, ensure_ascii=False),
+            ])
+            result = run_sample(
+                Sample(id="test-stage-usage", nl_text="测试分阶段记账", problem_type="milp",
+                       expected={"objective_value": 220.0},
+                       extra={"data_dir": str(data_dir)}),
+                llm=llm, cfg=load_config())
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
         assert result.success is True, result.errors
         stages = result.stage_usage
-        assert set(stages) == {"understand", "reflect", "rewrite"}, stages
-        for name in ("understand", "reflect", "rewrite"):
+        assert set(stages) == {"understand", "rewrite"}, stages
+        for name in ("understand", "rewrite"):
             assert stages[name]["calls"] == 1, (name, stages[name])
         assert sum(s["calls"] for s in stages.values()) == result.token_usage.get("calls")
     check("stage usage attribution", _stage_usage)
 
     # 16) 求解超时 / 不限时接线
     def _solve_timeout():
-        ir = get_gold_ir("knapsack-01")
+        ir = _knapsack_ir()
         sol = solve(ir, time_limit=1e-9)
         assert sol.status in ("timeout", "optimal"), f"实际状态: {sol.status}"
     check("solve time_limit wired", _solve_timeout)
 
     def _solve_no_limit():
-        sol = solve(get_gold_ir("knapsack-01"))
+        sol = solve(_knapsack_ir())
         assert sol.status == "optimal"
         assert sol.objective_value == 220.0
     check("solve default no limit works", _solve_no_limit)

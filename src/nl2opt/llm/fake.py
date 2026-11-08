@@ -1,4 +1,4 @@
-"""离线 Fake LLM Provider：不联网，用于测试/演示「理解→反思→重写」闭环。
+"""离线 Fake LLM Provider：不联网，用于测试/演示「理解→重写」闭环。
 
 两种实现都实现 LLMProvider 接口，可无缝替换 DeepSeekProvider：
 
@@ -14,9 +14,8 @@
         if "UNDERSTAND_IR" in joined:
             return json.dumps(corrupt_ir)      # 模拟“理解错”
         if "REWRITE_IR" in joined:
-            return json.dumps(gold_ir)         # 模拟“修好”
-        if "REFLECT" in joined:
-            return "建模错误：rhs 应为 100"
+            return json.dumps         # 模拟“修好”
+                return "建模错误：rhs 应为 100"
         return "{}"
 
     llm = CallableProvider(handler)

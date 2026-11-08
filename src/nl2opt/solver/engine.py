@@ -43,8 +43,8 @@ def _split_constraints(ir: IR):
 
     # 目标系数（统一为最小化）
     # 用累加而非赋值：IR 层已规范化（合并同变量项），此处仍用 += 作**防御性正确**——
-    # 万一有路径绕过规范化，累加与 codegen/PuLP 的语义一致，避免双后端分叉
-    # （历史缺陷：`c[idx[var]] = coef` 赋值覆盖，重复项只取最后一项，与 docker 不一致）。
+    # 即便有路径绕过规范化，这里也按**累加**处理（`2*x + 3*x = 5*x`），
+    # 与 LinearExpr 的合并语义一致（历史缺陷：曾用赋值覆盖，重复项只取最后一项）。
     c = np.zeros(n)
     for t in ir.objective.expr.terms:
         c[idx[t.var]] += t.coef
@@ -177,7 +177,7 @@ def solve(ir: IR, time_limit: float | None = None) -> SolverResult:
         if fun is not None:
             # 目标常数项**不参与寻优**（不影响 argmin），但必须计入**目标值**。
             # 历史缺陷：此前漏加，导致同一 IR 在两个后端上给出不同目标值——
-            # codegen（docker 后端）会输出 `LpAffineExpression(constant=...)`，
+            # 目标常数统一由 LinearExpr.constant 承载，
             # 而本地 HiGHS 路径丢弃常数，属跨后端不一致。
             # 实测影响面很小（已评测数据中仅 1 题含非零常数），但属静默错误。
             fun += float(ir.objective.expr.constant or 0.0)
@@ -213,7 +213,7 @@ def _map_status(res: Any) -> str:
 
     ⚠️ 不变量：若将来新增迭代上限或 node 上限，status=1 将不再等价于超时，
     此处**必须**重新区分（例如结合 `res.message` 判断），否则会把「迭代耗尽」
-    误报为「超时」，进而误导 L1~L4 的错误层级路由。
+    误报为「超时」，进而误导失败归因。
 
     原始 `status` 与 `message` 已由调用方原样保留在 `SolverResult.raw` / `.message`，
     诊断信息不因这里的归并而丢失。

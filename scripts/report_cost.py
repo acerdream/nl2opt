@@ -1,4 +1,4 @@
-"""Token 成本报表：各阶段 token 汇总 × 模型单价。
+﻿"""Token 成本报表：各阶段 token 汇总 × 模型单价。
 
 计费口径对齐 DeepSeek 官方「模型 & 价格」（三段分别计价）：
     费用 = 缓存命中输入 × 命中单价 + 缓存未命中输入 × 未命中单价 + 输出 × 输出单价
@@ -6,8 +6,8 @@
   其余含周末与法定节假日为空闲时段，空闲价为高峰价的一半）
 
 分阶段归因的两种来源：
-- **精确**：结果含 `stage_usage`（由 `_UsageTrackingLLM` 按 understand/reflect/rewrite/
-  repair_code 分别记账）——新运行的评测都带此字段；
+- **精确**：结果含 `stage_usage`（由 `_UsageTrackingLLM` 按 understand/rewrite/
+  rewrite 分别记账）——新运行的评测都带此字段；
 - **估算**：旧结果只有整样本合计。此时按「各阶段调用次数」比例分摊 token，
   并在报告中显著标注为估算（真实 token 分布与调用次数并不成比例）。
 
@@ -35,9 +35,6 @@ OUT = ROOT / "artifacts" / "COST_REPORT.md"
 CST = timezone(timedelta(hours=8))  # 北京时间
 
 # 分阶段判定的路由标记（与 orchestrator 的 route 文案一致）
-_ROUTE_L1 = "L1(代码修复"
-_ROUTE_L3 = "L3"
-_ROUTE_L2 = "L2"
 
 
 def _is_peak(dt: datetime) -> bool:
@@ -108,15 +105,7 @@ def _estimate_stage_calls(res: dict) -> Counter:
     counts: Counter = Counter()
     counts["understand"] += 1     # 走 LLM 理解的样本至少一次理解调用
     for step in res.get("trajectory") or []:
-        if step.get("reflection"):
-            counts["reflect"] += 1
         route = step.get("route") or ""
-        if _ROUTE_L1 in route:
-            counts["repair_code"] += 1
-        elif _ROUTE_L3 in route:
-            counts["understand"] += 1
-        elif _ROUTE_L2 in route:
-            counts["rewrite"] += 1
     return counts
 
 
@@ -151,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         samples = [r for r in data if isinstance(r, dict)]
         if not any(r.get("token_usage") for r in samples):
-            continue          # 无 LLM 调用的评测（local/docker 后端）跳过
+            continue          # 无 LLM 调用的评测跳过
 
         rate = args.rate
         if rate == "auto":
@@ -296,14 +285,14 @@ def main(argv: list[str] | None = None) -> int:
             lines.append(f"| `{stage}` | {c} | {c/est_calls*100:.1f}% | {est_cost*c/est_calls:.4f} |")
         lines.append("")
         lines.append("> ⚠️ 该分摊只按**调用次数**比例，未考虑各阶段 prompt/completion 体量差异"
-                     "（如 `rewrite` 的 prompt 含完整 IR，单次 token 远高于 `reflect`），"
+                     "（如 `rewrite` 的 prompt 含完整 IR，单次 token 较高），"
                      "因此**不能**当作精确值。要精确统计请用带 `stage_usage` 的新结果重跑。\n")
 
     lines.append("## 四、说明与口径\n")
     lines.append("1. **精确性**：总 tokens 与总成本来自 `usage` 实测字段（`prompt_cache_hit_tokens` /"
                  " `prompt_cache_miss_tokens` / `completion_tokens`），与官方计费口径一致。")
     lines.append("2. **分阶段**：`stage_usage` 由 `_UsageTrackingLLM.set_stage()` 在"
-                 " understand / reflect / rewrite / repair_code 各调用点标注，属精确归因；"
+                 " understand / rewrite 各调用点标注，属精确归因；"
                  "旧结果无此字段时退化为按调用次数分摊的估算。")
     lines.append("3. **单价可覆盖**：`--cache-hit/--cache-miss/--output` 或 `--rate peak|idle`；"
                  "默认取 `config.yaml` 的 `llm.pricing`。")

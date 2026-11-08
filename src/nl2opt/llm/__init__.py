@@ -100,8 +100,21 @@ class DeepSeekProvider(LLMProvider):
             raise LLMError(f"DeepSeek 返回 {resp.status_code}: {resp.text[:500]}")
 
         data = resp.json()
+
+        # 显式校验响应骨架：服务端偶发返回 `{"choices": null}`（限流/后端异常），
+        # 直接 `data["choices"][0]` 会抛 TypeError，被上层宽泛的 `except Exception`
+        # 捕获后**伪装成「建模/理解失败」**，把服务故障误报成模型能力问题。
+        if not isinstance(data, dict):
+            raise LLMError(f"响应不是 JSON 对象: {str(data)[:300]}")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            err = data.get("error") or data.get("message") or data
+            raise LLMError(f"响应缺少 choices（疑似限流或服务异常）: {str(err)[:400]}")
+
         try:
-            choice = data["choices"][0]
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise LLMError(f"choices[0] 不是对象: {str(choice)[:200]}")
             message = choice["message"]
             text = message.get("content") or ""
             finish_reason = choice.get("finish_reason")
@@ -111,8 +124,8 @@ class DeepSeekProvider(LLMProvider):
                 rc = message.get("reasoning_content") or ""
                 if rc.strip():
                     text = rc
-        except (KeyError, IndexError) as exc:
-            raise LLMError(f"响应结构异常: {data}") from exc
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"响应结构异常: {str(data)[:400]}") from exc
 
         return LLMResponse(
             text=text,
@@ -154,21 +167,23 @@ def complete_structured(
     retry_low_reasoning: bool = True,
     require_nonempty: bool = True,
 ) -> LLMResponse:
-    """统一 LLM 响应保护层：截断 / 空输出检测 + 一次低推理强度重试 + 带 stage 的明确错误。
+    """统一 LLM 响应保护层：截断 / 空输出检测 + 一次重试 + 带 stage 的明确错误。
 
     为什么需要它（实测缺陷）：同一个「模型截断 / 空输出」在 `understand` 阶段有明确错误，
-    但在 `rewrite` / `reflect` 阶段却直接 `extract_json(resp.text)` 或把空文本默认落到 L2——
-    于是「预算不足」被误报成「建模错误 / 路由错误」，污染 L1~L3 归因。
+    但在 `rewrite` 阶段却直接 `extract_json(resp.text)` 或把空文本当成建模错误——
+    于是「预算不足」被误报成「建模错误」，污染失败归因。
 
     职责：
-    - `resp.truncated`（finish_reason=length）或 `resp.text` 为空 → 降 `reasoning_effort="low"`
-      重试一次（思考型模型常见陷阱：reasoning 吃光输出预算，正文 JSON 被截断）；
-    - 重试后仍截断 → 抛带 stage 名的 `LLMError`（含调大 max_tokens / 降 reasoning 的指引）；
+    - `resp.truncated`（finish_reason=length）或 `resp.text` 为空 → 重试一次
+      （思考型模型常见陷阱：reasoning 吃光输出预算，正文 JSON 被截断）。
+      `reasoning_effort` 已全局固定为 `low`，因此这里重试**不再降档**，
+      而是一次同参数重试（对空输出/瞬时抖动有效，对真实预算不足基本无效）；
+    - 重试后仍截断 → 抛带 stage 名的 `LLMError`（指引调大 `max_tokens`）；
     - 重试后仍空（且 `require_nonempty`）→ 抛带 stage 名的 `LLMError`。
 
     **只负责「生产失败」，不负责解析**：返回原始 `LLMResponse`，各阶段按需自行
-    `extract_json` / 提取代码。这样 understand/rewrite/reflect 对「LLM 没给出可用输出」
-    的判定一致，而解析失败（响应完整但 JSON 非法）仍由各阶段显式处理（如 reflect 转 L4）。
+    `extract_json` / 提取代码。这样 understand/rewrite 对「LLM 没给出可用输出」
+    的判定一致，而解析失败（响应完整但 JSON 非法）仍需各阶段显式处理。
     """
     resp = llm.complete(messages)
     if retry_low_reasoning and (resp.truncated or not resp.text.strip()):
@@ -180,7 +195,8 @@ def complete_structured(
     if resp.truncated:
         raise LLMError(
             f"[{stage}] LLM 输出被 max_tokens 截断（finish_reason=length）："
-            "请调大 config.yaml 的 llm.max_tokens，或降低 reasoning_effort"
+            "请调大 config.yaml 的 llm.max_tokens"
+            "（reasoning_effort 已固定 low，无进一步降档空间）"
         )
     if require_nonempty and not resp.text.strip():
         raise LLMError(f"[{stage}] LLM 返回空 content（思考可能耗尽 max_tokens）")

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nl2opt"
 version = "0.1.0"
-description = "自然语言线性/整数规划问题 → 可运行、可验证、可迭代修复的求解模型与代码（理解-建模-生成-执行-验证-反思-重写闭环）"
+description = "自然语言 → 优化模型：LLM 只产符号 IR，展开后由求解器与独立验证器复核，失败按验证原因重写（理解-展开-求解-验证-重写闭环）"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -1,36 +1,37 @@
-# Python
+# ---- Python ----
 __pycache__/
 *.py[cod]
 *.egg-info/
 .eggs/
 build/
 dist/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 .venv/
 venv/
 
-# 环境变量（含 API Key，切勿提交）
-.env
+# ---- 测试 / 类型检查缓存 ----
+# pytest 在本机若无法写 .pytest_cache，会退化成根目录下的 pytest-cache-files-*
+.pytest_cache/
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
 
-# 运行时产物
+# ---- 密钥（含 API Key，切勿提交）----
+.env
+.env.local
+
+# ---- 运行时产物 ----
 logs/
 artifacts/
 *.log
 
-# 已下载的数据集（体积大，按需放置）
-data/downloaded/
+# ---- 数据集（体积大，按需 clone，见 README「数据集」）----
+# MIPLIB-NL 约 462 MB / 1469 个文件：
+#   git clone --depth 1 https://github.com/zlifr/MIPLIB-NL data/MIPLIB-NL
+data/MIPLIB-NL/
+# 转换出来的清单（可用 scripts/convert_miplibnl.py 重新生成）
 data/*.jsonl
-!data/builtin/samples.jsonl
 
-# 原始数据集仓库与下载文件（可重新 clone/下载，见 DATA.md）
-data/NL4OPT/
-data/IndustryOR/
-data/or-bench-problems/
-data/IndustryOR.json
-
-# IDE / OS
+# ---- IDE / OS ----
 .idea/
 .vscode/
 .DS_Store

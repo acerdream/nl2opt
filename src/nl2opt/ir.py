@@ -79,7 +79,7 @@ class Variable(BaseModel):
     def _check_name(cls, v: str) -> str:
         """变量名不能是空白、不能超长。
 
-        空白名会让 codegen 生成非法 Python（` = LpVariable(...)` → SyntaxError），
+        空白名会让后续任何引用（日志、序列化、求解器传参）失效，
         把契约错误推迟成执行错误；超长名（>200）几乎必是理解错误而非真实建模。
         """
         if not v or not v.strip():
@@ -138,12 +138,6 @@ class Variable(BaseModel):
                 out.append(f"{self.name}_{item}")
         return out
 
-    def index_suffix(self, instance: str) -> str:
-        """从实例名反推索引后缀（codegen 用作 dict 键），如 y_J1_M1 → 'J1_M1'。"""
-        prefix = f"{self.name}_"
-        return instance[len(prefix):] if instance.startswith(prefix) else instance
-
-
 class LinearExpr(BaseModel):
     """线性表达式：sum(coef * var) + constant。"""
 
@@ -159,11 +153,8 @@ class LinearExpr(BaseModel):
     def _normalize_terms(self) -> "LinearExpr":
         """合并同变量项、删除零系数项，并按变量名排序，保证表达式表示的**唯一性**。
 
-        否则重复项会引发**双后端语义分叉**（严重缺陷，曾实测确认）：
-        - `solver/engine.py` 用赋值覆盖：`c[idx[var]] = coef` → 只取最后一项；
-        - `codegen`/PuLP 用累加：`2*x + 3*x = 5*x`。
-        同一 IR 在 local 与 docker 后端得到**不同模型**。
-        规范化后二者一致，且哈希、日志、代码生成、求解全部统一。
+        否则重复项会产生歧义：赋值覆盖（只取最后一项）与累加（`2*x + 3*x = 5*x`）
+        会得到**不同模型**。规范化后唯一：哈希、日志、求解全部一致。
 
         零系数阈值 1e-12 与 `objective_term_count` / `objective_is_degenerate`
         的阈值一致，等价于浮点噪声。
@@ -257,11 +248,9 @@ class IR(BaseModel):
 
         危害：这类模型对任何可行解都返回同一个目标值（通常 0），
         当参考答案恰好为 0 时会被误判为「求解正确」，而实际上目标根本没被建模。
-        实测案例：OR-Bench 排班题 SCH-002 / SCH-015 的目标项数为 0，
-        参考模型分别有 4 项和 6 项，却因黄金值为 0 而通过。
 
         注意：纯可行性问题（只找可行解）的目标本就为空，属**合法**情形，
-        因此本方法只做事实判定，是否判错由 `verifier.check_objective_defined()` 决定。
+        因此本方法只做事实判定（是否判错由上层决定）。
         """
         terms = self.objective.expr.terms
         if not terms:
@@ -305,9 +294,7 @@ class IR(BaseModel):
         if missing:
             # 一次报**全部**（不是只报第一个），并尽量把缺失实例归因到变量族。
             # 动机：VRP/网络流这类按「节点对」展开的题，变量族规模是 n²；LLM 若把
-            # index_set 列漏了若干组合，只报第一个会让 L3 重理解无法定位整体缺口。
-            # 实测案例 industryor-036：约束 deg_in_19 引用 x_8_19 未声明 → 只报一处，
-            # 导致理解失败即终止（rounds=0），闭环未启动。
+            # index_set 列漏了若干组合，只报第一个会让修复环节无法定位整体缺口。
             hints: list[str] = []
             for where, name in missing[:6]:
                 fam = next((b for b in families if name.startswith(b + "_")), None)
@@ -330,7 +317,7 @@ class IR(BaseModel):
             if c.sense not in (Sense.le, Sense.ge, Sense.eq):
                 raise ValueError(f"约束 {c.name} 的 sense 非法: {c.sense}")
 
-        # 约束名唯一：重复名会让「按名字定位/修复约束」的反思与日志歧义
+        # 约束名唯一：重复名会让「按名字定位/修复约束」的重写与日志歧义
         seen: set[str] = set()
         for c in self.constraints:
             if c.name in seen:

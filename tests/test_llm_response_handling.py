@@ -12,8 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pytest  # noqa: E402
 
 from nl2opt.llm import LLMError, LLMMessage, LLMProvider, LLMResponse  # noqa: E402
-from nl2opt.pipeline.reflect import ReflectionParseError, _parse_reflection  # noqa: E402
-from nl2opt.pipeline.rewrite import rewrite  # noqa: E402
+from nl2opt.pipeline.rewrite import rewrite_symbolic  # noqa: E402
 from nl2opt.pipeline.understand import understand  # noqa: E402
 
 
@@ -40,37 +39,30 @@ def test_understand_rejects_truncated_response():
         understand("测试截断", TruncatingProvider())
 
 
+def _empty_sym():
+    """一个最小的符号模型（保护层只关心「响应能不能用」，不看模型内容）。"""
+    from nl2opt.symbolic import SymbolicIR
+    return SymbolicIR.model_validate(
+        {"variables": [], "objective": {"sense": "minimize", "expr": {"terms": []}},
+         "constraints": []}
+    )
+
+
 def test_rewrite_rejects_truncated_response():
-    from nl2opt.ir import IR, LinearExpr, Objective, Sense
-    ir = IR(variables=[], objective=Objective(sense=Sense.minimize, expr=LinearExpr()))
     with pytest.raises(LLMError, match="rewrite.*截断"):
-        rewrite("测试题", ir, "err", "advice", _FixedLLM(text='{"x": ', finish_reason="length"))
+        rewrite_symbolic("测试题", _empty_sym(), "err",
+                         _FixedLLM(text='{"x": ', finish_reason="length"))
 
 
-def test_reflect_rejects_empty_response():
-    from nl2opt.pipeline.reflect import reflect
-    with pytest.raises(LLMError, match="reflect.*空"):
-        reflect("测试题", "{}", "err", _FixedLLM(text="   ", finish_reason="stop"))
-
-
-def test_reflect_parse_failure_does_not_default_to_l2():
-    # 响应完整但 JSON 非法且无关键词 → ReflectionParseError，而非默认 L2
-    with pytest.raises(ReflectionParseError):
-        _parse_reflection("这段文字没有任何层级信号")
-
-
-def test_reflect_keyword_fallback_still_works():
-    r = _parse_reflection("这是建模错误：rhs 应为 100")
-    assert r.category == "L2"
-
-
-def test_reflect_json_parses():
-    r = _parse_reflection('{"layer": "L3", "advice": "漏了约束"}')
-    assert r.category == "L3" and r.advice == "漏了约束"
+def test_rewrite_rejects_empty_response():
+    """空响应（只有空白）也要被保护层拦下，不能送去解析。"""
+    with pytest.raises(LLMError):
+        rewrite_symbolic("测试题", _empty_sym(), "err",
+                         _FixedLLM(text="   ", finish_reason="stop"))
 
 
 def test_no_answer_value_leak_into_prompt():
-    """check_optimality 失败 message 不得含参考答案数值（污染 reflect/rewrite prompt）。"""
+    """check_optimality 失败 message 不得含参考答案数值（污染 rewrite prompt）。"""
     from nl2opt import verifier
     from nl2opt.solver import SolverResult
     sol = SolverResult(status="optimal", objective_value=221.0, variables={})

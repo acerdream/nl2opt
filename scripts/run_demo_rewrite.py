@@ -1,10 +1,11 @@
-"""离线演示完整闭环：理解（给错 IR）→ 建模 → 生成 → 执行 → 验证(失败)
-→ 反思 → 重写（给对 IR）→ 再次验证(通过)。
+"""离线演示完整闭环：理解（给错 IR）→ 执行 → 验证(失败) → 重写（给对 IR）→ 验证(通过)。
 
 全程用 ScriptedProvider（不联网），按闭环的固定调用顺序返回：
   第 1 次调用 = understand（给错误 IR）
-  第 2 次调用 = reflect（给诊断建议）
-  第 3 次调用 = rewrite（给正确 IR）
+  第 2 次调用 = rewrite（给正确 IR）
+
+> 早期还有第 2 步 `reflect`（单独一次调用产出「诊断建议」）。该环节已删除：
+> 失败原因直接放进 rewrite 的提示词，让 LLM 一次完成「诊断 + 修复」。
 """
 from __future__ import annotations
 
@@ -16,14 +17,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nl2opt.config import load_config  # noqa: E402
 from nl2opt.dataset import Sample  # noqa: E402
-from nl2opt.gold_ir import get_gold_ir  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _ir_fixtures  # noqa: E402
 from nl2opt.llm.fake import ScriptedProvider  # noqa: E402
 from nl2opt.pipeline import run_sample  # noqa: E402
 
 
 def main() -> int:
     cfg = load_config()
-    correct_ir = get_gold_ir("knapsack-01").model_dump()
+    correct_ir = _ir_fixtures.knapsack_ir().model_dump()
 
     # 错误 IR：把 knapsack-01 的价值系数 100 写成 1000（会得到 1080，验证失败）
     wrong_ir = json.loads(json.dumps(correct_ir))
@@ -31,12 +33,11 @@ def main() -> int:
         if t["var"] == "x2":
             t["coef"] = 1000.0
 
-    # 按调用顺序给出响应：understand → reflect → rewrite
+    # 按调用顺序给出响应：understand → rewrite
     llm = ScriptedProvider(
         responses=[
-            json.dumps(wrong_ir, ensure_ascii=False),                 # understand
-            "建模错误：x2 的价值系数应为 100 而非 1000，请修正目标函数。",  # reflect
-            json.dumps(correct_ir, ensure_ascii=False),               # rewrite
+            json.dumps(wrong_ir, ensure_ascii=False),      # understand
+            json.dumps(correct_ir, ensure_ascii=False),    # rewrite
         ],
         name="fake-rewrite-demo",
     )
@@ -65,7 +66,6 @@ def main() -> int:
             if t["var"] == "x2":
                 x2 = t["coef"]
         checks = " | ".join(c["message"] for c in step["checks"])
-        refl = step.get("reflection", {}).get("category", "")
         print(f"  round {step['round']}: x2 系数={x2}, 状态={step['status']}, 反思={refl or '-'}")
         print(f"    校验: {checks}")
 

@@ -6,18 +6,13 @@ llm:
   model: deepseek-flash       # 实测可用模型：deepseek-v4-pro / deepseek-flash
   api_key_env: DEEPSEEK_API_KEY
   temperature: 0.0
-  reasoning_effort: medium   # 思考强度：low / medium / high（实测 medium 在 OR-Bench 上
-                             # 显著快于 high，且大模型题的正确率损失有限）
-  max_tokens: 65536           # 思考型模型会占用 max_tokens，需给足（否则正文可能被截断）
-                              # 历史：8192 对 NL4OPT 小 LP 够用；OR-Bench 大模型实测需 16k~32k；
-                              # 但 32768 仍是**临界**——实测 OR-Bench SCH-007 一次成功（completion 31,635）、
-                              # 一次截断失败，属随机悬崖。65536 已实测 API 接受且余量充足。
-  timeout_seconds: 600         # 单次调用超时：思考型模型 + 32k 输出可能耗时数分钟，
+  reasoning_effort: low        # 固定 low
+                          
+  max_tokens: 65536           # 思考型模型会占用 max_tokens，需给足（否则正文 JSON 被截断）
+                              # 历史：32768 对最大实例是**临界值**（一次成功、一次截断，属随机悬崖）
+  timeout_seconds: 600         # 单次调用超时：思考型模型 + 大输出可能耗时数分钟，
                                # 给太小会把「题大」误判为「失败」（300s 实测不足）
 
-  # 单价（元 / 百万 tokens）。来源：DeepSeek 官方「模型 & 价格」页，
-  # 计费口径 = 缓存命中输入 + 缓存未命中输入 + 输出（三段分别计价）。
-  # 高峰时段：北京时间 周一至周五（不含法定节假日）9:00-12:00、14:00-18:00；其余为空闲时段。
   pricing:
     currency: CNY
     default_model: deepseek-flash
@@ -42,28 +37,18 @@ llm:
           output: 27.0
 
 pipeline:
-  max_rounds: 3               # 闭环最多迭代轮数（理解→…→反思→重写）
-  objective_tolerance: 1e-4   # 目标值对比容差
-  feasibility_tolerance: 1e-6 # 可行性/整数性检查容差
-  repeated_error_limit: 3     # 连续相同错误达到 N 轮即终止（避免空转烧 token）
+  attempts: 2                  # 每题最多几次「解答机会」。每次都是独立的「理解→修复」，
+                               # 任何一次成功即停止。2 = 给两次机会。
+  max_rounds: 3                # 单次机会内最多求解几轮 → **3 轮 = 2 次修复**
+                               # （第 3 轮失败后不再重写，除非还有下一轮可用）
+  objective_tolerance: 1e-4    # 目标值对比容差
+  feasibility_tolerance: 1e-6  # 可行性/整数性检查容差
+  repeated_error_limit: 3      # 连续相同错误达到 N 轮即终止（避免空转烧 token）
 
 executor:
-  backend: local              # 执行后端：local = 进程内 scipy 求解 IR；docker = 受限容器执行生成代码
-  timeout_seconds: 30         # 执行超时（docker 后端下为容器内墙钟预算）
-  docker_image: nl2opt-sandbox
-  memory: 512m                # 容器内存上限
-  cpus: "1"                   # 容器 CPU 配额
-  pids_limit: 128             # 容器进程数上限
-  l1_max_retries: 1           # L1 代码层修复最大尝试次数（用尽后升级 L2 重写 IR）
+  timeout_seconds: 120         # 单题求解墙钟预算（秒）
 
 paths:
   data_dir: data
-  builtin_file: data/builtin/samples.jsonl
   logs_dir: logs
   artifacts_dir: artifacts
-  cache_file: artifacts/cache.json   # 三级哈希缓存持久化路径
-
-cache:
-  namespace: default          # 缓存命名空间（人工逃生阀之一：切换后整体失效，隔离不同实验）
-  version: 1                  # 缓存版本（每次重大 prompt/schema/solver 改动主动递增，
-                              # 作为 CacheContext 未覆盖语义的兜底失效开关）

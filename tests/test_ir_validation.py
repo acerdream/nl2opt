@@ -24,7 +24,7 @@ def _obj(coef=1.0, var="x"):
 
 # ---------- 引用完整性（未声明变量）----------
 # 动机：VRP/网络流这类按「节点对」展开的变量族规模是 n²，LLM 若把 index_set 列漏，
-# 旧实现只报第一个缺失实例 → L3 重理解无法定位整体缺口（实测 industryor-036）。
+# 旧实现只报第一个缺失实例 → 修复环节无法定位整体缺口。
 
 
 def test_undeclared_variable_rejected():
